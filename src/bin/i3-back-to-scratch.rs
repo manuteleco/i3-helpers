@@ -20,7 +20,7 @@
 
 use clap::Parser;
 use i3_ipc::{
-    event::{Event, Subscribe, WindowChange, WindowData},
+    event::{Event, Subscribe, WindowChange, WindowData, WorkspaceChange, WorkspaceData},
     reply::Node,
     Connect, I3Stream, I3,
 };
@@ -70,11 +70,12 @@ impl FocusMonitor {
         // We need separate connections for listening and sending commands.
         // Otherwise they'll step on each other's toes causing the i3_ipc
         // library to panic when it receives messages it didn't expect.
-        let mut i3 = I3Stream::conn_sub([Subscribe::Window])?;
+        let mut i3 = I3Stream::conn_sub([Subscribe::Window, Subscribe::Workspace])?;
         for event in i3.listen() {
             match event? {
                 Event::Window(ev) => self.handle_window_event(ev)?,
-                _ => unreachable!("Subscribed to only window events"),
+                Event::Workspace(ev) => self.handle_workspace_event(ev)?,
+                _ => unreachable!("Subscribed to only window and workspace events"),
             }
         }
         Ok(())
@@ -88,12 +89,39 @@ impl FocusMonitor {
         Ok(())
     }
 
+    fn handle_workspace_event(&mut self, event: Box<WorkspaceData>) -> io::Result<()> {
+        // This branch covers the case when:
+        //
+        // 1. the scratchpad window is open in a workspace,
+        // 2. we switch to another workspace that happens to be empty
+        // 3. and then we summon the scratchpad window again.
+        //
+        // What happens in that, during 2., there are no windows to receive the
+        // Window `Focus` event and, therefore, we never send the window to the
+        // scratchpad area.
+        //
+        // This forces us to consider the Workspace `Focus` events as well, and
+        // send the window to the scratchpad area when switching to an empty
+        // workspace from having the scratchpad window focused.
+        if let WorkspaceChange::Focus = event.change {
+            let focused_workspace_is_empty = event
+                .current
+                .as_ref()
+                .map(is_empty_workspace)
+                .unwrap_or(false);
+            if focused_workspace_is_empty {
+                if let Focused::Scratchpad(id) = self.last_focused {
+                    self.move_to_scratchpad(id)?;
+                    self.last_focused = Focused::Other;
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn handle_last_focused(&mut self, container: &Node) -> io::Result<()> {
         match self.last_focused {
-            Focused::Scratchpad(id) if id != container.id => {
-                let cmd = format!("[con_id={}] move scratchpad", id);
-                self.i3_conn.run_command(&cmd)?;
-            }
+            Focused::Scratchpad(id) if id != container.id => self.move_to_scratchpad(id)?,
             _ => (),
         }
         Ok(())
@@ -115,4 +143,14 @@ impl FocusMonitor {
             .map(|class| class == &self.scratchpad_class)
             .unwrap_or(false)
     }
+
+    fn move_to_scratchpad(&mut self, container_id: usize) -> io::Result<()> {
+        let cmd = format!("[con_id={container_id}] move scratchpad");
+        self.i3_conn.run_command(&cmd)?;
+        Ok(())
+    }
+}
+
+fn is_empty_workspace(node: &Node) -> bool {
+    node.floating_nodes.is_empty() && node.nodes.is_empty()
 }
